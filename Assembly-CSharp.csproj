@@ -61,7 +61,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Assets\CameraScript.cs" />
-    <Compile Include="Assets\LiveStream.cs" />
+    <Compile Include="Assets\LiveStreamProducer.cs" />
     <Compile Include="Assets\MagicLeap\Scripts\MLVersion.cs" />
     <Compile Include="Assets\PrivilegeRequester.cs" />
     <None Include="Assets\BlendShader.shader" />

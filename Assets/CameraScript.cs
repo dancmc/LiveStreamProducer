@@ -29,8 +29,8 @@ public class CameraScript : MonoBehaviour
     
     // gameCamera is the main camera rendering objects for the user to view
     private Camera gameCamera;
-    // renderCamera is a second camera shadowing gameCamera, which renders game objects
-    // directly to renderRt
+    // second camera shadowing gameCamera, renders game objects directly to renderRt for use
+    // in integration later
     private Camera renderCamera;
     // renderRt is the target rendertexture for renderCamera
     private RenderTexture renderRt;
@@ -44,67 +44,52 @@ public class CameraScript : MonoBehaviour
     // running on headset
     private RenderTexture testRt;
     
-    /*
-     * Networking and network discovery objects.
-     * ssdp Request and Listen threads are used for SSDP service discovery,
-     * works on desktop but not on ML headsets, have been commented out
-     */
+    // Texture where external & internal camera frames are drawn to, then compressed
+    // to jpg and transmitted
+    private static Texture2D videoCaptureTexture;
+    
+    
+    // Networking and network discovery objects
     private TcpClient client = new TcpClient();
     private volatile bool socketConnected;
-    private static bool externalCameraActive;
-    
-    private Thread discoveryThread;
     private UnityWebRequest discoveryRequest;
-    private bool connectionAttemptFinished = true;
+    private Thread connectionThread;
     
-    private Thread ssdpRequestThread;
-    private Thread ssdpListenThread;
+    private bool connectionAttemptFinished = true;
 
+    // indicates that external camera is started and available for use
+    private static bool externalCameraActive;
     // indicates that a jpg frame has been sent and a new one can proceed
     private bool readyToSend = true;
-    
-    
-    // Failed attempt to compress jpgs in a background thread
-    // However encodeToJpg is a Unity method and cannot be called in a non-main thread
-    private static BlockingCollection<int> sendingQueue = new BlockingCollection<int>();
-    private static bool texture1Available = true;
-    private static bool texture2Available = true;
-    private static Texture2D videoCaptureTexture;
-    private static Texture2D videoCaptureTexture2;
 
-    // Attempt to save short snippets of video to file using built in API then transmit those
-    // API latency made this unusable
-    private int count = 0;
-    String filepath;
-    private VideoState videostate = VideoState.VIDEO_NONE;
-
-    private bool cursorLookMode = true;
     
     // Set logging on or off (logging introduces lag)
     private const bool logEnabled = true;
+    private bool cursorLookMode = true;
+    
 
+    //============================================================================================
+    //   
+    // LIFECYCLE METHODS
+    //
+    //=============================================================================================
+    
     public CameraScript()
     {
         instance = this;
         Debug.unityLogger.logEnabled = logEnabled;
     }
-    
-    private static void MLog(String str)
-    {
-        Debug.unityLogger.Log(str);
-    }
 
+    // Initialise all components
     private void Awake()
     {
-        
-        filepath = Path.Combine(Application.persistentDataPath, "vid.mp4");
+        // Assign the camera variables
         gameCamera = Camera.main;
         renderCamera = GetComponent<Camera>();
         
         // Initialise the shader
         material = new Material(blendShader);
         
-
         // Initialise the rendertextures and colour testRt black
         testRt = new RenderTexture(960, 540, 0);
         renderRt = new RenderTexture(960, 540, 0);
@@ -115,6 +100,7 @@ public class CameraScript : MonoBehaviour
         GL.Clear(true, true, color);
         RenderTexture.active = previous;
 
+        
         // Set renderRt as the target texture of the secondary camera
         renderCamera.targetTexture = renderRt;
         // Pass renderRt reference to shader for sampling later
@@ -122,34 +108,120 @@ public class CameraScript : MonoBehaviour
 
         videoCaptureTexture = new Texture2D(960, 540, TextureFormat.RGBA32, false);
         videoCaptureTexture2 = new Texture2D(960, 540, TextureFormat.RGBA32, false);
+        filepath = Path.Combine(Application.persistentDataPath, "vid.mp4");
     }
     
-    void Start()
+    IEnumerator Start()
     {
-        // Start long running coroutine to generate frames and transmit
-        StartCoroutine(nameof(RenderAndSend));
+        // Start long running coroutine to generate Jpgs and transmit
+        while (true)
+        {
+            yield return new WaitForEndOfFrame();
+   
+            processJpg();
+            
+            // Enable this instead of processJpg() to try the fragmented video approach
+            // processVideo();
+        }
     }
-
   
     
     private void Update()
     {
-        if (Input.GetKeyUp(KeyCode.X))
+        checkForFPSToggle();
+    }
+    
+    // manually update secondary camera to follow main camera every frame
+    private void OnPreRender()
+    {
+        renderCamera.gameObject.transform.position = gameCamera.gameObject.transform.position;
+        renderCamera.gameObject.transform.rotation = gameCamera.gameObject.transform.rotation;
+    }
+    
+     // Create a Jpg from a combination of an external camera frame and an in-game frame and transmit
+    void processJpg()
+    {
+        long t = currentTime();
+
+        if (!socketConnected || !readyToSend) return;
+        
+      
+        readyToSend = false;
+
+        //  Create a temporary RenderTexture of the same size as the texture
+        var tmp = RenderTexture.GetTemporary(960,540,0,
+            RenderTextureFormat.Default,RenderTextureReadWrite.Linear);
+
+        MLog("processJpg :: Blitting " + (currentTime() - t));
+
+
+        // Use actual external camera frame as background if available, otherwise placeholder
+        // Use shader to overlay in-game frame on top of external camera
+        // (In-game renderTexture assigned to shader in Awake() )
+        if (externalCameraActive)
         {
-            MLog("X pressed");
-            if (cursorLookMode)
-            {
-                GameObject.Find("FPSController").GetComponent<FirstPersonController>().enabled = false;
-                cursorLookMode = false;
-            }
-            else
-            {
-                GameObject.Find("FPSController").GetComponent<FirstPersonController>().enabled = true;
-                cursorLookMode = true;
-            }
+            Graphics.Blit(MLCamera.PreviewTexture2D, tmp, material);
         }
+        else
+        {
+            Graphics.Blit(testRt, tmp, material);
+        }
+
+        // Set blitted renderTexture as active and read to a Texture2D
+        var previous = RenderTexture.active;
+        RenderTexture.active = tmp;
+        
+        MLog("processJpg :: Reading pixels " + (currentTime() - t));
+        videoCaptureTexture.ReadPixels(new Rect(0, 0, 960, 540), 0,0);
+        videoCaptureTexture.Apply();
+        RenderTexture.active = previous;
+        RenderTexture.ReleaseTemporary(tmp);
+
+        // Texture2Ds can be encoded to jpg by Unity
+        MLog("processJpg :: Encoding JPG ");
+        var jpgBytes = videoCaptureTexture.EncodeToJPG(40);
+        var bytes = Encoding.UTF8.GetBytes(jpgBytes.Length + "\n");
+        
+        MLog("processJpg :: Starting sending " + jpgBytes.Length + " bytes");
+        try
+        {
+            // write the size of the jpg, then the actual jpg
+            instance.client.GetStream().Write(bytes, 0, bytes.Length);
+            instance.client.GetStream().Write(jpgBytes, 0, jpgBytes.Length);
+        }
+        catch (Exception e)
+        {
+            MLog("processJpg :: Error -"+e.Message);
+            
+            closeClient();
+            socketConnected = false;
+            
+            findNewServer();
+        }
+
+        MLog("processJpg :: Done");
+
+        readyToSend = true;
+        
+    }
+    
+    private void OnDestroy()
+    {
+        closeClient();
+        
+        connectionThread?.Interrupt();
+        ssdpListenThread?.Interrupt();
+        ssdpRequestThread?.Interrupt();  
     }
 
+    
+    //============================================================================================
+    //   
+    // CAMERA/STREAM INITIATION METHODS
+    //
+    //=============================================================================================
+    
+    
     // Entry point to start streaming once permissions have been handled
     public static void permissionsHandled(bool permissionsGranted)
     {
@@ -164,7 +236,7 @@ public class CameraScript : MonoBehaviour
 
     private void enableExternalCamera()
     {
-        MLog("External Camera Enabled");
+        MLog("enableExternalCamera :: External Camera Enabled");
         MLCamera.Start();
         MLCamera.Connect();
         MLCamera.StartPreview();
@@ -173,7 +245,7 @@ public class CameraScript : MonoBehaviour
 
     private void disableExternalCamera()
     {
-        MLog("External Camera Disabled");
+        MLog("disableExternalCamera :: External Camera Disabled");
         MLCamera.StopPreview();
         MLCamera.Disconnect();
         MLCamera.Stop();
@@ -187,70 +259,56 @@ public class CameraScript : MonoBehaviour
         instance.findNewServer();
     }
 
-    
-    // manually update secondary camera to follow main camera every frame
-    private void OnPreRender()
-    {
-        renderCamera.gameObject.transform.position = gameCamera.gameObject.transform.position;
-        renderCamera.gameObject.transform.rotation = gameCamera.gameObject.transform.rotation;
-    }
 
-
-    // Attempt to encode a frame and transmit if possible at end of each frame
-    IEnumerator RenderAndSend()
-    {
-        while (true)
-        {
-            yield return new WaitForEndOfFrame();
-
-            
-            processJpg();
-            
-            // processVideo();
-        }
-    }
-
+    //============================================================================================
+    //   
+    // NETWORK METHODS
+    //
+    //=============================================================================================
     
     // Discover server application address (demo assumes only one server active)     
     private void findNewServer()
     {
-        MLog("Finding new server");
+        MLog("findNewServer :: Finding new server");
         
-        // This makes a http call to a private server to obtain
-        // a previously registered server address
+        // Http call to a private server to obtain a previously registered server address
         StartCoroutine(getServerAddress());
 
-        // This section is the alternative method - automatic service
-        // discovery. Works on desktop, but headsets cannot seem to 
-        // send or receive UDP multicasts
+        // This section is the alternative method - automatic service discovery. Works on desktop,
+        // but headsets cannot seem to send or receive UDP multicasts
 
-//        listenThread = new Thread(listenForServiceReply);
-//        listenThread.IsBackground = true;
-//        listenThread.Start();
-//
-//        sendThread = new Thread(sendServiceRequest);
-//        sendThread.IsBackground = true;
-//        sendThread.Start();
+        //  listenThread = new Thread(listenForServiceReply);
+        //  listenThread.IsBackground = true;
+        //  listenThread.Start();
+
+        // sendThread = new Thread(sendServiceRequest);
+        // sendThread.IsBackground = true;
+        // sendThread.Start();
     }
 
     
     
-    // Coroutine to attempt fetching pre-registered server address at intervals 
-    // Once valid address received, attempt to connect then start receiving stream
+    // Coroutine to attempt fetching pre-registered server address at intervals.
+    // Once valid address received, attempt to connect then start receiving stream.
+    // The connection logic unfortunately cannot be easily delegated to one thread because
+    // UnityWebRequest must be called on the main thread, necessitating a complicated 
+    // workaround.
     IEnumerator getServerAddress()
     {
         
         while (!socketConnected)
         {
+            MLog("getServerAddress :: Making discovery request");
+            
             discoveryRequest = UnityWebRequest.Get("https://danielchan.io/mldiscovery/get");
             yield return discoveryRequest.SendWebRequest();
               
             if(discoveryRequest.isNetworkError || discoveryRequest.isHttpError) {
-                MLog(discoveryRequest.error);
+                MLog("getServerAddress :: Error - "+discoveryRequest.error);
             }
 
             var message = discoveryRequest.downloadHandler.text;
-            MLog(message);
+            MLog("getServerAddress :: Received server address - "+message);
             
             var address = message.Split(':');
             var ip = address[0];
@@ -258,23 +316,123 @@ public class CameraScript : MonoBehaviour
             if(ip.Equals("") || port<1) continue;
 
             connectionAttemptFinished = false;
-            discoveryThread = new Thread(()=>connectToServerBlocking(ip, port));
-            discoveryThread.IsBackground = true;
-            discoveryThread.Start();
+            connectionThread = new Thread(()=>connectToServerBlocking(ip, port));
+            connectionThread.IsBackground = true;
+            connectionThread.Start();
             
             yield return new WaitUntil(() => connectionAttemptFinished);
+            MLog("getServerAddress :: Finished connection attempt");
             
-            MLog("Finished Connection");
-
-            discoveryThread = null;
-            
+            yield return new WaitForSeconds(3);
         }
-
-
     }
 
-   
     
+    // Connect to server once address discovered
+    void connectToServerBlocking(string ip, int port)
+    {
+        closeClient();
+        
+        try{
+            client = new TcpClient();
+            client.Connect(ip, port);
+            var initialMessage = Encoding.UTF8.GetBytes("producer\n");
+            client.GetStream().Write(initialMessage, 0, initialMessage.Length);
+            var reader = new StreamReader(client.GetStream());
+            var response = reader.ReadLine();
+            if (response.Contains("rejected"))
+            {
+                closeClient();
+            }
+            else
+            {
+                socketConnected = true;
+            }
+            MLog("connectToServerBlocking :: Response from server - "+response);
+        }
+        catch (Exception e)
+        {
+            MLog("connectToServerBlocking :: Error -"+e.Message);
+        }
+
+        connectionAttemptFinished = true;
+        connectionThread = null;
+    }
+
+    // Convenience method to close tcp client safely
+    private void closeClient()
+    {
+        try
+        {
+            client.Close();
+            socketConnected = false;
+        }
+        catch (ObjectDisposedException e)
+        {
+            MLog("closeClient :: Error -"+e.Message);
+        }
+    }
+
+    //============================================================================================
+    //   
+    // UTILITY METHODS
+    //
+    //=============================================================================================
+    
+    // Convenience method for logging. The Unity logger can however introduce significant delay 
+    private void MLog(String str)
+    {
+        Debug.unityLogger.Log(str);
+    }
+    
+    // Returns current Unix time in ms
+    private long currentTime()
+    {
+        return (long) (DateTime.Now - new DateTime(1970, 1, 1)).TotalMilliseconds;
+    }
+
+    // Toggles use of the FPS Controller when X is pressed on keyboard
+    private void checkForFPSToggle()
+    {
+        if (Input.GetKeyUp(KeyCode.X))
+        {
+            MLog("checkForFPSToggle :: X pressed");
+            
+            var fpsController = GameObject.Find("FPSController")?.GetComponent<FirstPersonController>();
+            if (fpsController == null) return;
+            
+            if (cursorLookMode)
+            {
+                fpsController.enabled = false;
+                cursorLookMode = false;
+            }
+            else
+            {
+                fpsController.enabled = true;
+                cursorLookMode = true;
+            }
+        }
+    }
+
+    
+
+    //============================================================================================
+    //   
+    // DISCARDED CODE
+    //
+    // Code samples for selected approaches that have been tried and rejected. Included for possible
+    // reuse in future development.
+    //
+    //=============================================================================================
+
+    
+    // :::::: SSDP (Simple Service Discovery Protocol) ::::::
+    // Attempt to use UDP Multicast to well-known multicast address to request server details.
+    // Worked using desktop applications, but unable to replicate on headset (eg unable to receive 
+    // even other background chatter on UniWireless or private router network). 
+    
+    private Thread ssdpRequestThread;
+    private Thread ssdpListenThread;
     
     // UDP Multicast to request service announcement
     void sendServiceRequest()
@@ -305,7 +463,7 @@ public class CameraScript : MonoBehaviour
         ssdpRequestThread = null;
     }
 
-    // UDP Multicast receiving to wait for service announcement containing server address
+    // Listening for service announcement over UDP Multicast containing server address
     void listenForServiceReply()
     {
         var udpClient = new UdpClient();
@@ -333,7 +491,7 @@ public class CameraScript : MonoBehaviour
             if (parts.Length < 2) continue;
 
             var address = parts[1].Split(':');
-            client.Close();
+            closeClient();
             client = new TcpClient();
            
             
@@ -343,124 +501,33 @@ public class CameraScript : MonoBehaviour
             {
                 break;
             }
- 
+
 
         }
 
         ssdpListenThread = null;
     }
     
-    // Connect to server once address discovered
-    void connectToServerBlocking(String ip, int port)
+    
+
+    // :::::: FRAGMENTED VIDEO ::::::
+    // Attempt to record and send consecutive short video fragments using VideoCapture API.
+    // Non-viable due to delay in stopping and starting recording to disk. Does not integrate
+    // holograms anayway.
+    
+    private int count = 0;
+    String filepath;
+    private VideoState videostate = VideoState.VIDEO_NONE;
+
+    enum VideoState
     {
-        try
-        {
-            client.Close();
-        }
-        catch (Exception e)
-        {
-            MLog(e.Message);
-        }
-        
-        try{
-            client = new TcpClient();
-            client.Connect(ip, port);
-            var initialMessage = Encoding.UTF8.GetBytes("producer\n");
-            client.GetStream().Write(initialMessage, 0, initialMessage.Length);
-            var reader = new StreamReader(client.GetStream());
-            var response = reader.ReadLine();
-            if (response.Contains("rejected"))
-            {
-                client.Close();
-                socketConnected = false;
-            }
-            else
-            {
-                socketConnected = true;
-            }
-            MLog(response);
-        }
-        catch (Exception e)
-        {
-            MLog(e.Message);
-        }
-
-        connectionAttemptFinished = true;
-    }
-
-
-    // Create a Jpg from a combination of an external camera frame and an in-game frame and transmit
-    void processJpg()
-    {
-        long t = currentTime();
-        if (socketConnected && readyToSend)
-        {
-            readyToSend = false;
-
-            //  Create a temporary RenderTexture of the same size as the texture
-            var tmp = RenderTexture.GetTemporary(
-                960,
-                540,
-                0,
-                RenderTextureFormat.Default,
-                RenderTextureReadWrite.Linear);
-
-            MLog("Blitting " + (currentTime() - t));
-
-
-            // Use actual external camera frame as background if available, otherwise placeholder
-            // Use shader to overlay in game frame on top of external camera 
-            
-            if (externalCameraActive)
-            {
-                Graphics.Blit(MLCamera.PreviewTexture2D, tmp, material);
-            }
-            else
-            {
-                Graphics.Blit(testRt, tmp, material);
-            }
-
-            // Set blitted renderTexture as active and read to a Texture2D
-            var previous = RenderTexture.active;
-            RenderTexture.active = tmp;
-            MLog("Reading Pixels " + (currentTime() - t));
-
-
-            videoCaptureTexture.ReadPixels(new Rect(0, 0, 960, 540), 0,
-                0);
-            videoCaptureTexture.Apply();
-            RenderTexture.active = previous;
-            RenderTexture.ReleaseTemporary(tmp);
-
-            // Texture2Ds can be encoded to jpg by Unity
-            var jpgBytes = videoCaptureTexture.EncodeToJPG(40);
-
-            
-            var bytes = Encoding.UTF8.GetBytes(jpgBytes.Length + "\n");
-            MLog("Starting Sending " + jpgBytes.Length);
-            try
-            {
-                // write the size of the jpg, then the actual jpg
-                instance.client.GetStream().Write(bytes, 0, bytes.Length);
-                instance.client.GetStream().Write(jpgBytes, 0, jpgBytes.Length);
-            }
-            catch (Exception e)
-            {
-                MLog(e.Message);
-                socketConnected = false;
-
-                findNewServer();
-            }
-
-            MLog("Done " + jpgBytes.Length);
-
-
-            readyToSend = true;
-        }
-    }
-
-    // This is alternative approach of recording short videos using the Video Capture API and transmitting.
-    // Unusable due to latency
+        VIDEO_NONE,
+        VIDEO_READY,
+        VIDEO_STARTED,
+        VIDEO_ENDED,
+        VIDEO_SENT
+    }    
+    
     void processVideo()
     {
         if (videostate == VideoState.VIDEO_READY)
@@ -510,34 +577,17 @@ public class CameraScript : MonoBehaviour
             MLog("File does not exist yet");
         }
     }
-    
-    // Utility method
-    private long currentTime()
-    {
-        return (long) (DateTime.Now - new DateTime(1970, 1, 1)).TotalMilliseconds;
-    }
-
-    private void OnDestroy()
-    {
-        discoveryThread?.Interrupt();
-        ssdpListenThread?.Interrupt();
-        ssdpRequestThread?.Interrupt();
-        
-    }
 
 
-    enum VideoState
-    {
-        VIDEO_NONE,
-        VIDEO_READY,
-        VIDEO_STARTED,
-        VIDEO_ENDED,
-        VIDEO_SENT
-    }
 
-
-    // Code attempting to multithread JPG encoding with a queue
+    // :::::: JPG ENCODING MULTITHREADING ::::::
+    // Attempt to multithread JPG encoding with a queue
     // Failed due to only being able to call EncodeToJPG on main thread
+    
+    private static BlockingCollection<int> sendingQueue = new BlockingCollection<int>();
+    private static bool texture1Available = true;
+    private static bool texture2Available = true;
+    private static Texture2D videoCaptureTexture2;
     
 //	public void SendingThread()
 //	{

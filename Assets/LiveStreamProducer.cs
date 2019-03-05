@@ -7,10 +7,10 @@ using UnityEngine.XR.MagicLeap;
 
 /// <summary>
 /// This is a simple coordinator script for this stream producer app to request necessary privileges
-/// then activate streaming
+/// then activate streaming.
 /// </summary>
 [RequireComponent(typeof(PrivilegeRequester))]
-public class LiveStream : MonoBehaviour
+public class LiveStreamProducer : MonoBehaviour
 {
     private PrivilegeRequester _privilegeRequester;
 
@@ -28,6 +28,9 @@ public class LiveStream : MonoBehaviour
         StartCoroutine(setPosition());
     }
 
+
+    // A bit of a hack to make sure objects are positioned around user on app start.
+    // Otherwise sometimes objects persist elsewhere in the room in old positions from previous runs.
     IEnumerator setPosition()
     {
         yield return new WaitForSeconds(1);
@@ -36,7 +39,7 @@ public class LiveStream : MonoBehaviour
         cube.transform.position = mainCamTransform.position + mainCamTransform.forward * 2f;
         sphere.transform.position = mainCamTransform.position + mainCamTransform.right * -2f;
         vitals.transform.position = mainCamTransform.position + mainCamTransform.right * 2f;
-        
+
         sphere.transform.LookAt(mainCam.transform);
         vitals.transform.rotation = Quaternion.LookRotation(vitals.transform.position - mainCamTransform.position);
     }
@@ -47,27 +50,25 @@ public class LiveStream : MonoBehaviour
         if (_privilegeRequester != null) _privilegeRequester.OnPrivilegesDone -= HandlePrivilegesDone;
     }
 
- private void HandlePrivilegesDone(MLResult result)
+
+    // Method adapted from official ML tutorial samples
+    private void HandlePrivilegesDone(MLResult result)
     {
-        if (result.IsOk)
-        {
-            Debug.Log("Succeeded in requesting all privileges");  
-            CameraScript.permissionsHandled(true);
-            
-        }
-        else
+        if (!result.IsOk)
         {
             if (result.Code == MLResultCode.PrivilegeDenied) Instantiate(Resources.Load("PrivilegeDeniedError"));
 
             Debug.LogErrorFormat(
-                "Error: LiveStream failed to get all requested privileges, disabling script. Reason: {0}",
+                "handlePrivilegesDone :: LiveStreamProducer failed to get all requested " +
+                "privileges, disabling script. Reason: {0}",
                 result);
             CameraScript.permissionsHandled(false);
             enabled = false;
+            
+            return;
         }
-
         
+        Debug.Log("handlePrivilegesDone :: Succeeded in requesting all privileges");
+        CameraScript.permissionsHandled(true);
     }
-
-
 }
