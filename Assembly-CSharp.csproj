@@ -64,7 +64,6 @@
     <Compile Include="Assets\LiveStream.cs" />
     <Compile Include="Assets\MagicLeap\Scripts\MLVersion.cs" />
     <Compile Include="Assets\PrivilegeRequester.cs" />
-    <None Include="Assets\Surface.shader" />
     <None Include="Assets\BlendShader.shader" />
     <None Include="Assets\MagicLeap\Libs\LuminUnity.xml" />
     <Reference Include="Unity.XR.MagicLeap.Editor">
